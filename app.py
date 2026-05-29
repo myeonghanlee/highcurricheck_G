@@ -11,7 +11,6 @@ def parse_and_audit(file):
     try:
         df_raw = pd.read_excel(file, sheet_name='2026입학생', header=None)
         
-        # 헤더 병합
         row2 = df_raw.iloc[2].replace(r'^\s*$', np.nan, regex=True).ffill().fillna('')
         row3 = df_raw.iloc[3].fillna('')
         
@@ -32,7 +31,6 @@ def parse_and_audit(file):
                 
         df = pd.DataFrame(df_raw.values[6:], columns=headers)
         
-        # 기본 클렌징
         df['구분'] = df['구분'].replace('', np.nan).ffill().str.replace('\n', '').str.strip()
         subject_col = [col for col in df.columns if '교과' in col][0]
         df[subject_col] = df[subject_col].replace('', np.nan).ffill().str.replace('\n', ' ').str.strip()
@@ -42,14 +40,12 @@ def parse_and_audit(file):
         
         df_valid = df.dropna(subset=[course_col]).copy()
         
-        # 과목명 및 과목유형 양끝 공백 일괄 제거
         df_valid[course_col] = df_valid[course_col].astype(str).str.strip()
         df_valid[type_col] = df_valid[type_col].astype(str).str.strip()
         
         credit_col = [col for col in df.columns if '운영' in col and '학점' in col][0]
         df_valid[credit_col] = pd.to_numeric(df_valid[credit_col], errors='coerce').fillna(0)
         
-        # [핵심 개선] '이수 학점'과 '필수 이수 학점' 컬럼 찾기 및 숫자형 변환
         try:
             comp_col_name = [c for c in df_valid.columns if '이수' in c.replace('\n', '') and '필수' not in c.replace('\n', '')][0]
             req_col_name = [c for c in df_valid.columns if '필수' in c.replace('\n', '') and '이수' in c.replace('\n', '')][0]
@@ -57,14 +53,11 @@ def parse_and_audit(file):
             df_valid[req_col_name] = pd.to_numeric(df_valid[req_col_name], errors='coerce').fillna(0)
             df_valid = df_valid.rename(columns={comp_col_name: '이수학점_합계', req_col_name: '필수이수학점_기준'})
         except IndexError:
-            # 컬럼을 찾지 못한 경우 예외 처리
             df_valid['이수학점_합계'] = 0
             df_valid['필수이수학점_기준'] = 0
 
-        # 컬럼 표준화
         df_valid = df_valid.rename(columns={subject_col: '교과(군)', course_col: '과목', credit_col: '운영학점', type_col: '과목유형'})
         
-        # 탐지 로직 (동일 과목 오류, 1학년 일반선택 등)
         duplicate_issues = {}
         groups = df_valid.groupby('과목')['운영학점'].nunique()
         dup_subjects = groups[groups > 1].index.tolist()
@@ -85,20 +78,27 @@ def parse_and_audit(file):
         st.error(f"파싱 오류: {e}")
         return None, {}, []
 
-# --- 2. 학점 계산 함수 ---
+# --- 2. 학점 계산 함수 (교차 이수 대괄호 지원) ---
 def calculate_credits(df):
     semester_cols = ['1학년_1학기', '1학년_2학기', '2학년_1학기', '2학년_2학기', '3학년_1학기', '3학년_2학기']
     designated_mask = df['구분'].str.contains('학교지정', na=False)
-    designated_total = df[designated_mask]['운영학점'].sum()
     
     choice_total_credits = 0
     semester_student_totals = {sem: 0.0 for sem in semester_cols}
     
     for sem in semester_cols:
         if sem in df.columns:
-            des_sem_sum = pd.to_numeric(df[designated_mask][sem], errors='coerce').fillna(0).sum()
+            # 1. 학교지정 학기별 합산 (대괄호 '[1]' 등 교차이수 문자열의 숫자 추출 기능 추가)
+            des_sem_vals = df[designated_mask][sem].dropna().astype(str).str.strip()
+            des_sem_sum = 0
+            for val in des_sem_vals:
+                # '[1]', '2' 등에서 순수 숫자만 추출하여 합산
+                match = re.search(r'\[?(\d+(\.\d+)?)\]?', val)
+                if match:
+                    des_sem_sum += float(match.group(1))
             semester_student_totals[sem] += des_sem_sum
             
+            # 2. 학생선택 '택N' 합산
             unique_choice = df[~designated_mask][sem].dropna().unique()
             sem_choice_sum = 0
             for val in unique_choice:
@@ -109,16 +109,19 @@ def calculate_credits(df):
             semester_student_totals[sem] += sem_choice_sum
             choice_total_credits += sem_choice_sum
                     
+    # 학교지정 총 학점은 각 학기 합계의 절반 (교차 이수 '[1]'과 '1'이 양쪽에 있으면 두번 더해지므로)
+    # 하지만 엑셀의 '운영학점' 열이 정확하다면 그걸 쓰는 것이 가장 안전합니다.
+    designated_total = df[designated_mask]['운영학점'].sum()
+    
     course_total = designated_total + choice_total_credits
     grand_total = course_total + 18
     
     return int(course_total), int(grand_total), semester_student_totals
 
-# --- 3. 종합 검토 함수 ---
+# --- 3. 종합 검토 함수 (체육 교차 이수 검증 강화) ---
 def validate_curriculum(df, actual_total_credits, semester_student_totals, duplicate_issues):
     results = []
     
-    # 교과(군)별로 기입된 '이수학점' 및 '필수이수학점'의 대표값(최대값) 추출
     group_comp = df.groupby('교과(군)')['이수학점_합계'].max()
     group_req = df.groupby('교과(군)')['필수이수학점_기준'].max()
 
@@ -128,13 +131,13 @@ def validate_curriculum(df, actual_total_credits, semester_student_totals, dupli
     else:
         results.append(("총 교과 이수 학점", f"총 {actual_total_credits}학점 (기준 174 미달)", "실패"))
 
-    # [개선 1] 필수 이수 학점 (이수학점 >= 필수이수학점일 때 필수학점 합산)
+    # 2. 필수 이수 학점
     req_sum = 0
     failed_req = []
     for subj in group_req.index:
         req_val = group_req[subj]
         comp_val = group_comp[subj]
-        if req_val > 0: # 필수 이수학점이 배당된 교과인 경우
+        if req_val > 0:
             if req_val <= comp_val:
                 req_sum += req_val
             else:
@@ -145,7 +148,7 @@ def validate_curriculum(df, actual_total_credits, semester_student_totals, dupli
     else:
         results.append(("필수 이수 학점 충족 여부", f"미달 발생: {', '.join(failed_req)}", "실패"))
 
-    # [개선 2] 국, 수, 영 과목의 "이수 학점" 직접 합산
+    # 3. 국수영 편중 방지
     basic_credits = 0
     for subj in group_comp.index:
         if any(keyword in subj for keyword in ['국어', '수학', '영어', '국 어', '수 학', '영 어']):
@@ -156,18 +159,20 @@ def validate_curriculum(df, actual_total_credits, semester_student_totals, dupli
     else:
         results.append(("국수영 편중 과다", f"국수영 이수학점 총합 {int(basic_credits)}학점 (81 상한 초과)", "실패"))
 
-    # [개선 3] 체육 교과 매 학기 편성 검토 (한 개라도 학점 표시가 있는지 정확히 확인)
+    # 4. [개선] 체육 교과 매 학기 편성 검토 (교차 이수 완벽 인식)
     pe_df = df[df['교과(군)'].str.contains('체육', na=False)]
     pe_miss = []
-    for sem in ['1학년_1학기', '1학년_2학기', '2학년_1학기', '2학년_2학기', '3학년_1학기', '3학년_2학기']:
+    semester_cols = ['1학년_1학기', '1학년_2학기', '2학년_1학기', '2학년_2학기', '3학년_1학기', '3학년_2학기']
+    
+    for sem in semester_cols:
         if sem in pe_df.columns:
-            # 해당 학기 컬럼에 값이 존재하고, 공백이 아닌 문자가 1개 이상 있는지 체크
-            has_entry = pe_df[sem].dropna().astype(str).str.strip().str.len() > 0
-            if not has_entry.any():
+            # 해당 학기에 1, 2, [1] 등 숫자를 포함한 유효한 배당 문자가 있는지 정규식으로 검사
+            valid_entries = pe_df[sem].dropna().astype(str).str.strip().str.contains(r'\[?\d+\]?', regex=True)
+            if not valid_entries.any():
                 pe_miss.append(sem.replace('_', ' '))
                 
     if not pe_miss:
-        results.append(("체육 매 학기 편성", "6개 학기 모두 체육 과목 배당 확인", "성공"))
+        results.append(("체육 매 학기 편성", "교차 이수 포함, 6개 학기 모두 체육 과목 배당 정상 확인", "성공"))
     else:
         results.append(("체육 편성 누락", f"누락 학기: {', '.join(pe_miss)}", "실패"))
 
