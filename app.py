@@ -8,29 +8,58 @@ def parse_curriculum(file):
         # '2026입학생' 시트 로드 (헤더 없음)
         df_raw = pd.read_excel(file, sheet_name='2026입학생', header=None)
         
-        # 3행, 4행을 결합하여 컬럼명 생성
-        row2 = df_raw.iloc[2].fillna('')
+        # --- [수정된 부분] 헤더 병합 및 중복 방지 처리 ---
+        # 1. 윗줄(1학년, 2학년 등) 병합 셀 처리를 위해 빈칸을 앞의 값으로 채움(ffill)
+        row2 = df_raw.iloc[2].replace(r'^\s*$', np.nan, regex=True).ffill().fillna('')
         row3 = df_raw.iloc[3].fillna('')
-        headers = [f"{str(a).strip()}_{str(b).strip()}".strip('_').replace('\n', '') 
-                   for a, b in zip(row2, row3)]
+        
+        raw_headers = []
+        for a, b in zip(row2, row3):
+            a_str = str(a).strip().replace('\n', '')
+            b_str = str(b).strip().replace('\n', '')
+            
+            header = f"{a_str}_{b_str}".strip('_')
+            if not header:
+                header = "빈칸"
+            raw_headers.append(header)
+            
+        # 2. 컬럼명 중복 제거 (예: 빈칸, 빈칸_1, 2학기, 2학기_1 방지)
+        headers = []
+        seen = {}
+        for h in raw_headers:
+            if h in seen:
+                seen[h] += 1
+                headers.append(f"{h}_{seen[h]}")
+            else:
+                seen[h] = 0
+                headers.append(h)
+        # --------------------------------------------------
         
         # 7행부터 실제 데이터
         df = pd.DataFrame(df_raw.values[6:], columns=headers)
         
         # 병합된 셀(NaN) 채우기 (Forward Fill)
         df['구분'] = df['구분'].replace('', np.nan).ffill()
-        df['교과(군)'] = df['교과(군)'].replace('', np.nan).ffill()
         
-        # 불필요한 행 제거
-        df = df.dropna(subset=['과목'])
+        # 파일마다 '교과(군)' 띄어쓰기가 다를 수 있어 포함 문자로 유연하게 찾기
+        subject_col = [col for col in df.columns if '교과' in col][0]
+        df[subject_col] = df[subject_col].replace('', np.nan).ffill()
+        
+        # 불필요한 빈 행 제거
+        course_col = [col for col in df.columns if '과목' in col and '유형' not in col and '개설' not in col][0]
+        df = df.dropna(subset=[course_col])
         
         # 운영학점 숫자형 변환
-        df['운영학점'] = pd.to_numeric(df['운영학점'], errors='coerce').fillna(0)
+        credit_col = [col for col in df.columns if '운영' in col and '학점' in col][0]
+        df[credit_col] = pd.to_numeric(df[credit_col], errors='coerce').fillna(0)
+        
+        # 뒤의 검토 함수(validate_curriculum)가 잘 작동하도록 핵심 컬럼명 강제 통일
+        df = df.rename(columns={subject_col: '교과(군)', course_col: '과목', credit_col: '운영학점'})
         
         return df
     
     except Exception as e:
-        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+        st.error(f"파일을 파싱하는 중 오류가 발생했습니다: {e}")
         return None
 
 # --- 2. 검토 함수 ---
